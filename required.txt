@@ -1,4 +1,5 @@
 PyYAML
 requests
 emoji
-slackdown
+bson
+alive_progress

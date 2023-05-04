@@ -6,6 +6,8 @@ data/*
 conf/config.yaml
 helm/**/secret-values.yaml
 **/.env
+venv/*
+.idea/*
 #
 examples/
 

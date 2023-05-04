@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import requests
-import functools
 import traceback
 
 import os

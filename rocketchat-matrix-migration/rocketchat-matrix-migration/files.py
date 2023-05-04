@@ -14,12 +14,10 @@
 # limitations under the License.
 
 import requests
-import slackdown
 import logging
 import os
 
 from utils import send_event
-from emoji import emojize
 
 
 LOG_LEVEL = os.environ.get('LOG_LEVEL', "INFO").upper()
