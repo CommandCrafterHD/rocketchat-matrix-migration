@@ -20,25 +20,19 @@ import json
 import logging
 import os
 import re
-import secrets
-import string
 import sys
-import time
 import traceback
 import zipfile
+import gzip
+import bson
 
 import requests
-import slackdown
 import yaml
-from alive_progress import alive_bar
-from dotenv import load_dotenv
 from emoji import emojize
 
 from files import process_attachments, process_files
-
+from alive_progress import alive_bar
 from utils import send_event, invite_user
-
-load_dotenv()
 
 LOG_LEVEL = os.environ.get('LOG_LEVEL', "INFO").upper()
 ADMIN_USER_MATRIX = os.environ.get('ADMIN_USER_MATRIX')
@@ -47,7 +41,7 @@ ADMIN_PASS_MATRIX = os.environ.get('ADMIN_PASS_MATRIX')
 LOG_LEVEL = os.environ.get('LOG_LEVEL', "INFO").upper()
 
 logging.basicConfig(level=LOG_LEVEL)
-log = logging.getLogger('SLACK.MIGRATE')
+log = logging.getLogger('ROCKETCHAT.MIGRATE')
 log_filename = "log/migration.log"
 os.makedirs(os.path.dirname(log_filename), exist_ok=True)
 fileHandler = logging.FileHandler(log_filename, mode="w", encoding=None, delay=False)
@@ -57,7 +51,7 @@ log.addHandler(fileHandler)
 # log.addHandler(consoleHandler)
 
 
-channelTypes = ["dms.json", "groups.json", "mpims.json", "channels.json", "users.json"]
+channelTypes = ["users.bson.gz", "rocketchat_message.bson.gz", "rocketchat_room.bson.gz", "rocketchat_subscription.bson.gz"]
 userLUT = {}
 nameLUT = {}
 roomLUT = {}
@@ -114,10 +108,10 @@ def loadZip(config):
     jsonFiles = {}
     for channelType in channelTypes:
         try:
-            jsonFiles[channelType] = archive.open(channelType)
-            log.info("Found " + channelType + " in archive. Adding.")
+            jsonFiles[channelType.split(".")[0]] = gzip.decompress(archive.open(channelType).read())
+            log.info("Found " + channelType.split(".")[0] + " in archive. Adding.")
         except:
-            log.info("Warning: Couldn't find " + channelType + " in archive. Skipping.")
+            log.info("Warning: Couldn't find " + channelType.split(".")[0] + " in archive. Skipping.")
     return jsonFiles
 
 def loadZipFolder(config, folder):
@@ -131,6 +125,16 @@ def loadZipFolder(config, folder):
                 fileList.append(entry.filename)
 
         return fileList
+
+def decodeBson(file):
+    data = []
+
+    base = 0
+    while base < len(file):
+        base, d = bson.decode_document(file, base)
+        data.append(d)
+
+    return data
 
 # TODO: user alive-progress
 # using bubble bar and notes spinner
@@ -198,7 +202,7 @@ def login(server_location):
     }
 
     # Get the access token
-    r = requests.post(url, json=data, verify=config["verify-ssl"])
+    r = requests.post(url, json=data, verify=config_yaml["verify-ssl"])
 
     if r.status_code != 200:
         log.info("ERROR! Received %d %s" % (r.status_code, r.reason))
@@ -249,7 +253,7 @@ def register_user(
         "admin": admin,
     }
     try:
-        r = requests.put(url, json=data, headers=headers, verify=config["verify-ssl"])
+        r = requests.put(url, json=data, headers=headers, verify=config_yaml["verify-ssl"])
     except requests.exceptions.RequestException as e:
         # catastrophic error. bail.
         log.error(
@@ -305,7 +309,7 @@ def register_room(
 
     #_log.info("Sending registration request...")
     try:
-        r = requests.post(url, headers={'Authorization': 'Bearer ' + as_token}, json=body, verify=config["verify-ssl"], timeout=300 )
+        r = requests.post(url, headers={'Authorization': 'Bearer ' + as_token}, json=body, verify=config_yaml["verify-ssl"], timeout=300 )
     # except requests.exceptions.Timeout:
     #     # Maybe set up for a retry, or continue in a retry loop
     # except requests.exceptions.TooManyRedirects:
@@ -352,10 +356,7 @@ def autojoin_users(
         try:
             r = requests.post(url, headers={'Authorization': 'Bearer ' + config["as_token"]}, verify=config["verify-ssl"])
         except requests.exceptions.RequestException as e:
-            log.error(
-                "Logging an uncaught exception {}".format(e),
-                exc_info=(traceback)
-            )
+            log.error("Logging an uncaught exception {}".format(e), exc_info=(traceback))
             # log.debug("error creating room {}".format(body))
             return False
         else:
@@ -368,127 +369,126 @@ def autojoin_users(
                         pass
 
 def migrate_users(userFile, config, access_token):
-    log = logging.getLogger('SLACK.MIGRATE.USER')
+    log = logging.getLogger('ROCKETCHAT.MIGRATE.USER')
     userlist = []
-    userData = json.load(userFile)
+    userData = decodeBson(userFile)
+
     with alive_bar(len(userData), bar = 'bubbles', spinner = 'waves2') as bar:
         for user in userData:
-            if user["is_bot"] == True:
-                bar()
-                continue
-
-            # ignore slackbot
-            if user["id"] == "USLACKBOT":
+            if user["type"] != 'user':
                 bar()
                 continue
 
             _servername = config["homeserver"].split('/')[2]
-            _matrix_user = user["name"]
-            _matrix_id = '@' + user["name"] + ':' + _servername
+            _matrix_user = user["username"]
+            _matrix_id = '@' + user["username"] + ':' + _servername
 
             # check if display name is set
-            if "real_name" in user["profile"]:
-                _real_name = user["profile"]["real_name"]
+            if "name" in user:
+                _real_name = user["name"]
             else:
                 _real_name = ""
 
             # check if email is set
-            if "email" in user["profile"]:
-                _email = user["profile"]["email"]
+            if "emails" in user and len(user["emails"]) > 0:
+                _email = user["emails"][0]["address"]
             else:
                 _email = ""
 
-            # generate password
-            _alphabet = string.ascii_letters + string.digits
-            _password = ''.join(secrets.choice(_alphabet) for i in range(20)) # for a 20-character password
+            # Use password from RocketChat if not an ldap user. If ldap is true, we're going to leave the password blank.
+            if "ldap" in user and user["ldap"] == True:
+                _password = ""
+            elif "services" in user and "password" in user["services"]:
+                _password = user["services"]["password"]["bcrypt"]
 
             userDetails = {
-                "slack_id": user["id"],
-                "slack_team_id": user["team_id"],
-                "slack_name": user["name"],
-                "slack_real_name": _real_name,
-                "slack_email": _email,
+                "rocketchat_id": user["_id"],
+                "rocketchat_name": user["username"],
+                "rocketchat_real_name": _real_name,
+                "rocketchat_email": _email,
                 "matrix_id": _matrix_id,
                 "matrix_user": _matrix_user,
                 "matrix_password": _password,
             }
 
-            log.info("Registering Slack user " + userDetails["slack_id"] + " -> " + userDetails["matrix_id"])
+            log.info("Registering RocketChat user " + userDetails["rocketchat_id"] + " -> " + userDetails["matrix_id"])
             if not config["dry-run"]:
-                res = register_user(userDetails["matrix_user"], userDetails["matrix_password"], userDetails["slack_real_name"], config["homeserver"], access_token)
+                res = register_user(userDetails["matrix_user"], userDetails["matrix_password"], userDetails["rocketchat_real_name"], config["homeserver"], access_token)
                 if res == False:
                     log.error("ERROR while registering user '" + userDetails["matrix_id"] + "'")
                     continue
 
-                # TODO force password change at next login 
-                # https://github.com/euank/synapse-password-reset
-
-            userLUT[userDetails["slack_id"]] = userDetails["matrix_id"]
-            nameLUT[userDetails["matrix_id"]] = userDetails["slack_real_name"]
+            userLUT[userDetails["rocketchat_id"]] = userDetails["matrix_id"]
+            nameLUT[userDetails["matrix_id"]] = userDetails["rocketchat_real_name"]
             userlist.append(userDetails)
             # time.sleep(1)
             bar()
     return userlist
 
 
-def migrate_rooms(roomFile, config, admin_user):
-    log = logging.getLogger('SLACK.MIGRATE.ROOMS')
+def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
+    log = logging.getLogger('ROCKETCHAT.MIGRATE.ROOMS')
     roomlist = []
+    channelData = decodeBson(roomFile)
+    subscriptionData = decodeBson(subscriptionFile)
 
     # channels
-    channelData = json.load(roomFile)
     with alive_bar(len(channelData), bar = 'classic', spinner = 'waves2') as bar:
         for channel in channelData:
+            # Skip readonly channels?
             if config["skip-archived"]:
-                if channel["is_archived"] == True:
+                if channel["ro"] == True:
                     bar()
                     continue
+
+            if channel["t"] == "c":  # Channels
+                room_preset = "public_chat"
+                bar()
+                continue
+            elif channel["t"] == "d":  # Direct messages
+                room_preset = "private_chat"
+                _invitees = []
+                for subscription in [sub for sub in subscriptionData if sub["t"] == "d" and sub["rid"] == channel["_id"]]:
+                    _invitees.append(subscription["u"]["_id"])
+                pass
+            elif channel["t"] == "p":  # Teams
+                room_preset = "private_chat"
+                bar()
+                continue
+            else:  # Anything else, we just skip
+                bar()
+                continue
 
             if config_yaml["create-as-admin"]:
                 _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
             else:
                 # if user is not in LUT (maybe its a shared channel), default to admin_user
-                if channel["creator"] in userLUT:
-                    _mxCreator = userLUT[channel["creator"]]
+                if channel["uids"][0] in userLUT:
+                    _mxCreator = userLUT[channel["uids"][0]]
                 else:
                     _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
 
-            _invitees = []
-            if config_yaml["invite-all"]:
-                for user in nameLUT.keys():
-                    if user != _mxCreator:
-                        _invitees.append(user)
+            if "name" in channel:
+                _channelName = channel["name"]
             else:
-                for user in channel["members"]:
-                    if user != channel["creator"]:
-                        if user in userLUT: # ignore dropped users like bots
-                            _invitees.append(userLUT[user])
-
-            minimal_invites = []
-            for user in channel["members"]:
-                if user != channel["creator"]:
-                    if user in userLUT: # ignore dropped users like bots
-                        minimal_invites.append(userLUT[user])
-
+                _channelName = ""
 
 
             roomDetails = {
-                "slack_id": channel["id"],
-                "slack_name": channel["name"],
-                "slack_members": channel["members"],
-                "slack_topic": channel["topic"],
-                "slack_purpose": channel["purpose"],
-                "slack_created": channel["created"],
-                "slack_creator": channel["creator"],
+                "rocketchat_id": channel["_id"],
+                "rocketchat_name": _channelName,
+                "rocketchat_members": channel["uids"],
+                "rocketchat_topic": channel["topic"],
+                # "rocketchat_purpose": channel["purpose"],
+                "rocketchat_created": channel["ts"],
+                "rocketchat_creator": channel["uids"][0],
                 "matrix_id": '',
                 "matrix_creator": _mxCreator,
-                "matrix_topic": channel["topic"]["value"],
+                # "matrix_topic": channel["topic"]["value"],
             }
 
-            room_preset = "private_chat" if config_yaml["import-as-private"] else "public_chat"
-
             if not config["dry-run"]:
-                res = register_room(roomDetails["slack_name"], roomDetails["matrix_creator"], roomDetails["matrix_topic"], minimal_invites, room_preset, config["homeserver"], config["as_token"])
+                res = register_room(roomDetails["slack_name"], roomDetails["matrix_creator"], roomDetails["matrix_topic"], _invitees, room_preset, config["homeserver"], config["as_token"])
 
                 if res == False:
                     log.info("ERROR while registering room '" + roomDetails["slack_name"] + "'")
@@ -513,7 +513,7 @@ def migrate_rooms(roomFile, config, admin_user):
     return roomlist
 
 def migrate_dms(roomFile, config):
-    log = logging.getLogger('SLACK.MIGRATE.DMS')
+    log = logging.getLogger('ROCKETCHAT.MIGRATE.DMS')
     roomlist = []
 
     # channels
@@ -864,7 +864,7 @@ def kick_imported_users(server_location, admin_user, access_token, tick):
 
 def main():
     logging.captureWarnings(True)
-    log = logging.getLogger('SLACK.MIGRATE.MAIN')
+    log = logging.getLogger('ROCKETCHAT.MIGRATE.MAIN')
 
     config = test_config(yaml)
 
@@ -882,33 +882,33 @@ def main():
         log.info("ERROR! Admin user could not be logged in.")
         exit(1)
 
-    # create users in matrix and match them to slack users
-    if "users.json" in jsonFiles and not userLUT:
+    # create users in matrix and match them to RocketChat users
+    if "users" in jsonFiles and not userLUT:
         if not config["run-unattended"]:
             input('Creating users. Press enter to proceed\n')
         else:
             log.info("Creating Users")
-        userlist = migrate_users(jsonFiles["users.json"], config, access_token)
+        userlist = migrate_users(jsonFiles["users"], config, access_token)
 
-    # create rooms and match to channels
-    # Slack channels
-    if "channels.json" in jsonFiles and not roomLUT:
+    # create matrix rooms and match to RocketChat rooms
+    # RocketChat rooms
+    if "rocketchat_room" in jsonFiles and not roomLUT:
         if not config["run-unattended"]:
             input('Creating channels. Press enter to proceed\n')
         else:
             log.info("Creating channels")
-        roomlist_channels = migrate_rooms(jsonFiles["channels.json"], config, admin_user)
+        roomlist_channels = migrate_rooms(jsonFiles["rocketchat_room"], jsonFiles["rocketchat_subscription"], config, admin_user)
 
     # Slack groups
-    if "groups.json" in jsonFiles and not roomLUT:
+    if "groups" in jsonFiles and not roomLUT:
         if not config["run-unattended"]:
             input('Creating groups. Press enter to proceed\n')
         else:
             log.info("Creating groups")
-        roomlist_groups = migrate_rooms(jsonFiles["groups.json"], config, admin_user)
+        roomlist_groups = migrate_rooms(jsonFiles["groups.json"], jsonFiles["rocketchat_subscription"], config, admin_user)
 
     # create DMs
-    if "dms.json" in jsonFiles and not dmLUT:
+    if "dms" in jsonFiles and not dmLUT:
         if not config["run-unattended"]:
             input('Creating DMs. Press enter to proceed\n')
         else:
@@ -923,9 +923,9 @@ def main():
             roomLUT = roomLUT,
             roomLUT2 = roomLUT2,
             dmLUT = dmLUT,
-            users = userlist,
+            # users = userlist,
         )
-        with open('run/luts.yaml', 'w') as outfile:
+        with open('run/luts.yaml', 'w+') as outfile:
             yaml.dump(data, outfile, default_flow_style=False)
 
     # send events to rooms
@@ -934,7 +934,7 @@ def main():
     else:
         log.info("Migrating messages to rooms. This may take a while...")
     for slack_room, matrix_room in roomLUT.items():
-        log = logging.getLogger('SLACK.MIGRATE.MESSAGES.{}'.format(roomLUT2[slack_room]))
+        log = logging.getLogger('ROCKETCHAT.MIGRATE.MESSAGES.{}'.format(roomLUT2[slack_room]))
         log.info("Migrating messages for room: " + roomLUT2[slack_room])
         fileList = sorted(loadZipFolder(config, roomLUT2[slack_room]))
         if fileList:

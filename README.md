@@ -1,4 +1,5 @@
 # This is a fork of [the slack matrix migration tool](https://github.com/Awesome-Technologies/slack-matrix-migration) which I intend to somehow shoehorn into working with Rocket.Chat exports!
+# DISCLAIMER: THIS DOES NOT WORK YET. IT IS STILL WORK IN PROGRESS.
 
 # Slack to Matrix Migration
 Migrates Users, Channels and all the conversations from a Slack export to Matrix
