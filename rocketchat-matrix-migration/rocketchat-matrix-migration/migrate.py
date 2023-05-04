@@ -244,7 +244,7 @@ def register_user(
 
     url = "%s/_synapse/admin/v2/users/@%s:%s" % (server_location, user, config_yaml['domain'])
 
-    headers = {'Authorization': ' '.join(['Bearer', config_yaml['as_token']])}
+    headers = {'Authorization': ' '.join(['Bearer', access_token])}
 
     data = {
         "password": password,
