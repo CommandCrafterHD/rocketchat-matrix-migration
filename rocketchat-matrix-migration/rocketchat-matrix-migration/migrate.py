@@ -56,7 +56,6 @@ userLUT = {}
 nameLUT = {}
 roomLUT = {}
 roomLUT2 = {}
-dmLUT = {}
 eventLUT = {}
 threadLUT = {}
 replyLUT = {}
@@ -78,8 +77,8 @@ if os.path.isfile("run/luts.yaml"):
     nameLUT = luts["nameLUT"]
     roomLUT = luts["roomLUT"]
     roomLUT2 = luts["roomLUT2"]
-    dmLUT = luts["dmLUT"]
     read_luts = True
+    log.info("Read LUTs. Skipping migration of users and rooms. Delete /run/luts.yaml to re-migrate them.")
 
 def test_config(yaml):
     if not config_yaml["zipfile"]:
@@ -245,7 +244,7 @@ def register_user(
 
     url = "%s/_synapse/admin/v2/users/@%s:%s" % (server_location, user, config_yaml['domain'])
 
-    headers = {'Authorization': ' '.join(['Bearer', access_token])}
+    headers = {'Authorization': ' '.join(['Bearer', config_yaml['as_token']])}
 
     data = {
         "password": password,
@@ -373,7 +372,7 @@ def migrate_users(userFile, config, access_token):
     userlist = []
     userData = decodeBson(userFile)
 
-    with alive_bar(len(userData), bar = 'bubbles', spinner = 'waves2') as bar:
+    with alive_bar(len(userData), bar='bubbles', spinner='waves2', force_tty=True) as bar:
         for user in userData:
             if user["type"] != 'user':
                 bar()
@@ -433,7 +432,7 @@ def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
     subscriptionData = decodeBson(subscriptionFile)
 
     # channels
-    with alive_bar(len(channelData), bar = 'classic', spinner = 'waves2') as bar:
+    with alive_bar(len(channelData), bar='classic', spinner='waves2', force_tty=True) as bar:
         for channel in channelData:
             # Skip readonly channels?
             if config["skip-archived"]:
@@ -441,62 +440,74 @@ def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
                     bar()
                     continue
 
-            if channel["t"] == "c":  # Channels
-                room_preset = "public_chat"
-                bar()
-                continue
+            if channel["t"] == "c" or channel["t"] == "p":  # Channels and teams (this are almost identical)
+                room_preset = "public_chat" if channel["t"] == "c" else "private_chat"
+                _invitees = []
+                if channel["t"] == "c":
+                    for subscription in [sub for sub in subscriptionData if sub["t"] == "c" and sub["rid"] == channel["_id"]]:
+                        _invitees.append(subscription["u"]["_id"])
+                else:
+                    for subscription in [sub for sub in subscriptionData if sub["t"] == "p" and sub["rid"] == channel["_id"]]:
+                        _invitees.append(subscription["u"]["_id"])
+
+                if config_yaml["create-as-admin"]:
+                    _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
+                else:
+                    # if user is not in LUT (maybe its a shared channel), default to admin_user
+                    if "u" in channel and channel["u"]["_id"] in userLUT:
+                        _mxCreator = userLUT[channel["u"]["_id"]]
+                    else:
+                        _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
+
+                roomDetails = {
+                    "rocketchat_id": channel["_id"],
+                    "rocketchat_name": channel["name"],
+                    "rocketchat_members": _invitees,
+                    "rocketchat_created": channel["ts"],
+                    "rocketchat_creator": channel["u"]["_id"] if "u" in channel else "",
+                    "matrix_id": '',
+                    "matrix_creator": _mxCreator,
+                    "matrix_topic": '',
+                }
             elif channel["t"] == "d":  # Direct messages
                 room_preset = "private_chat"
                 _invitees = []
                 for subscription in [sub for sub in subscriptionData if sub["t"] == "d" and sub["rid"] == channel["_id"]]:
                     _invitees.append(subscription["u"]["_id"])
-                pass
-            elif channel["t"] == "p":  # Teams
-                room_preset = "private_chat"
-                bar()
-                continue
+
+                if config_yaml["create-as-admin"]:
+                    _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
+                else:
+                    # if user is not in LUT (maybe its a shared channel), default to admin_user
+                    if channel["uids"][0] in userLUT:
+                        _mxCreator = userLUT[channel["uids"][0]]
+                    else:
+                        _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
+
+                roomDetails = {
+                    "rocketchat_id": channel["_id"],
+                    "rocketchat_name": '',
+                    "rocketchat_members": channel["uids"],
+                    "rocketchat_created": channel["ts"],
+                    "rocketchat_creator": channel["uids"][0],
+                    "matrix_id": '',
+                    "matrix_creator": _mxCreator,
+                    "matrix_topic": '',
+                }
             else:  # Anything else, we just skip
                 bar()
                 continue
 
-            if config_yaml["create-as-admin"]:
-                _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
-            else:
-                # if user is not in LUT (maybe its a shared channel), default to admin_user
-                if channel["uids"][0] in userLUT:
-                    _mxCreator = userLUT[channel["uids"][0]]
-                else:
-                    _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
-
-            if "name" in channel:
-                _channelName = channel["name"]
-            else:
-                _channelName = ""
-
-
-            roomDetails = {
-                "rocketchat_id": channel["_id"],
-                "rocketchat_name": _channelName,
-                "rocketchat_members": channel["uids"],
-                "rocketchat_topic": channel["topic"],
-                # "rocketchat_purpose": channel["purpose"],
-                "rocketchat_created": channel["ts"],
-                "rocketchat_creator": channel["uids"][0],
-                "matrix_id": '',
-                "matrix_creator": _mxCreator,
-                # "matrix_topic": channel["topic"]["value"],
-            }
-
             if not config["dry-run"]:
-                res = register_room(roomDetails["slack_name"], roomDetails["matrix_creator"], roomDetails["matrix_topic"], _invitees, room_preset, config["homeserver"], config["as_token"])
+                res = register_room(roomDetails["rocketchat_name"], roomDetails["matrix_creator"], roomDetails["matrix_topic"], _invitees, room_preset, config["homeserver"], config["as_token"])
 
                 if res == False:
-                    log.info("ERROR while registering room '" + roomDetails["slack_name"] + "'")
+                    log.info("ERROR while registering room '" + roomDetails["rocketchat_name"] + "'")
                     continue
                 else:
                     _content = json.loads(res.content)
                     roomDetails["matrix_id"] = _content["room_id"]
-                log.info("Registered Slack channel " + roomDetails["slack_name"] + " -> " + roomDetails["matrix_id"])
+                log.info("Registered RocketChat channel " + roomDetails["rocketchat_name"] + " -> " + roomDetails["matrix_id"])
 
                 #invite all members
                 if config_yaml["invite-all"]:
@@ -504,67 +515,12 @@ def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
                 #autojoin all members
                 autojoin_users(_invitees, roomDetails["matrix_id"], config)
 
-            roomLUT[roomDetails["slack_id"]] = roomDetails["matrix_id"]
-            roomLUT2[roomDetails["slack_id"]] = roomDetails["slack_name"]
+            roomLUT[roomDetails["rocketchat_id"]] = roomDetails["matrix_id"]
+            roomLUT2[roomDetails["rocketchat_id"]] = roomDetails["rocketchat_name"]
             roomlist.append(roomDetails)
             #time.sleep(1)
             bar()
-
     return roomlist
-
-def migrate_dms(roomFile, config):
-    log = logging.getLogger('ROCKETCHAT.MIGRATE.DMS')
-    roomlist = []
-
-    # channels
-    channelData = json.load(roomFile)
-    with alive_bar(len(channelData), bar = 'squares', spinner = 'waves2') as bar:
-        for channel in channelData:
-            if config["skip-archived"]:
-                if channel["is_archived"] == True:
-                    bar()
-                    continue
-
-            # skip dms with slackbot
-            if channel["user"] == "USLACKBOT":
-                continue
-
-            _mxCreator = userLUT[channel["user"]]
-
-            _invitees = []
-            for user in channel["members"]:
-                if user != channel["user"]:
-                    _invitees.append(userLUT[user])
-
-            roomDetails = {
-                "slack_id": channel["id"],
-                "slack_members": channel["members"],
-                "slack_created": channel["created"],
-                "slack_creator": channel["user"],
-                "matrix_id": '',
-                "matrix_creator": _mxCreator,
-            }
-
-            if not config["dry-run"]:
-                res = register_room('', roomDetails["matrix_creator"], '', _invitees, "trusted_private_chat", config["homeserver"], config["as_token"])
-
-                if res == False:
-                    log.info("ERROR while registering room '" + roomDetails["slack_name"] + "'")
-                    continue
-                else:
-                    _content = json.loads(res.content)
-                    roomDetails["matrix_id"] = _content["room_id"]
-                log.info("Registered Slack DM channel " + roomDetails["slack_id"] + " -> " + roomDetails["matrix_id"])
-
-                #autojoin all members
-                autojoin_users(_invitees, roomDetails["matrix_id"], config)
-
-            dmLUT[roomDetails["slack_id"]] = roomDetails["matrix_id"]
-            roomlist.append(roomDetails)
-            bar()
-
-    return roomlist
-
 
 def send_reaction(config, roomId, eventId, reactionKey, userId, txnId):
 
@@ -604,163 +560,161 @@ def getFallbackText(replyEvent):
     originalBody = "\n> ".join(originalBody)
     return '> <' + replyEvent["sender"] + '> ' + originalBody
 
+def parse_rocketchat_markdown(md):
+    output = ""
+    newLine = '\n'
+    for entry in md:
+        if entry['type'] == 'PARAGRAPH':
+            for value in entry['value']:
+                if value['type'] == 'PLAIN_TEXT':
+                    output += value['value']
+                elif value['type'] == 'MENTION_USER':
+                    output += f"@{value['value']['value']}:{config_yaml['domain']}"
+                elif value['type'] == 'LINK':
+                    if value['value']['label']['value'] == ' ':  # This is a reply.
+                        # TODO: Figure out how to work with reply links
+                        continue
+                    output += f"[{value['value']['label']['value'] if value['value']['label']['value'] != '' else value['value']['src']['value']}]({value['value']['src']['value']})"  # Format links in [<LABEL>](<URL>) format. Replace the label with the URL if no label is given
+                elif value['type'] == 'EMOJI':
+                    output += f":{value['shortCode']}:"
+                elif value['type'] == 'INLINE_CODE':
+                    output += f"`{value['value']['value']}`"
+                elif value['type'] == 'BOLD':
+                    for string in entry['value']:
+                        output += f"{string['value']}"
+                else:
+                    log.info(f"Unsupported markdown-value type: {value['type']}")
+                    continue
+        elif entry['type'] == 'CODE':
+            output += f"\n```{entry['language']}\n{(line['value']['value'] + newLine for line in entry['value'])}```\n"
+        elif entry['type'] == 'LINE_BREAK':
+            output += '\n'
+        elif entry['type'] == 'BIG_EMOJI':
+            for emoji in entry['value']:
+                output += f":{emoji['value']['value']}: "
+        else:
+            log.info(f"Unsupported markdown type: {entry['type']}")
+            continue
+
+    return output
+
 def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
     content = {}
     is_thread = False
     is_reply = False
 
-    if message["type"] == "message":
-        if "subtype" in message:
-            if (message["subtype"] == "bot_message" or
-                message["subtype"] == "bot_remove" or
-                message["subtype"] == "channel_name" or
-                message["subtype"] == "channel_join" or
-                message["subtype"] == "channel_purpose" or
-                message["subtype"] == "group_name" or
-                message["subtype"] == "group_join" or
-                message["subtype"] == "group_purpose"):
-                    return txnId
+    # ignore hidden messages
+    # todo: find out if rocketchat does something like this
+    if "hidden" in message:
+        if message["hidden"] == True:
+            return txnId
 
-            if message["subtype"] == "file_comment":
-                # TODO migrate file_comments
-                return txnId
+    if "u" in message: #TODO what messages have no user?
+        if not message["u"]["_id"] in userLUT:
+            # ignore messages from bots or not already added users
+            return txnId
+    else:
+        log.info("Message without user, thanks rocketchat")
+        log.info(message)
 
-        # ignore hidden messages
-        if "hidden" in message:
-            if message["hidden"] == True:
-                return txnId
+    body = parse_rocketchat_markdown(message['md'])
 
-        if "user" in message: #TODO what messages have no user?
-            if not message["user"] in userLUT:
-                # ignore messages from bots
-                return txnId
-        else:
-            log.info("Message without user")
-            log.info(message)
+    # TODO do not migrate empty messages?
+    #if body == "":
+    #
+    #    return txnId
 
-        # list of subtypes
-        '''
-        bot_message	A message was posted by an app or integration
-        me_message	A /me message was sent
-        message_changed	A message was changed
-        message_deleted	A message was deleted
-        channel_join	A member joined a channel
-        channel_leave	A member left a channel
-        channel_topic	A channel topic was updated
-        channel_purpose	A channel purpose was updated
-        channel_name	A channel was renamed
-        channel_archive	A channel was archived
-        channel_unarchive	A channel was unarchived
-        group_join	A member joined a group
-        group_leave	A member left a group
-        group_topic	A group topic was updated
-        group_purpose	A group purpose was updated
-        group_name	A group was renamed
-        group_archive	A group was archived
-        group_unarchive	A group was unarchived
-        file_share	A file was shared into a channel
-        file_reply	A reply was added to a file
-        file_mention	A file was mentioned in a channel
-        pinned_item	An item was pinned in a channel
-        unpinned_item	An item was unpinned from a channel
-        '''
+    # replace mentions
+    body = body.replace("<!channel>", "@room")
+    body = body.replace("<!here>", "@room")
+    body = body.replace("<!everyone>", "@room")
+    body = re.sub('<@[A-Z0-9]+>', replace_mention, body)
 
-        body = message["text"]
+    # if "files" in message:
+    #     if "subtype" in message:
+    #         log.info(message["subtype"])
+    #         if message["subtype"] == "file_comment" or message["subtype"] == "thread_broadcast":
+    #             #TODO treat as reply
+    #             log.info("")
+    #         else:
+    #             txnId = process_files(message["files"], matrix_room, userLUT[message["user"]], body, txnId, config)
+    #     else:
+    #         txnId = process_files(message["files"], matrix_room, userLUT[message["user"]], body, txnId, config)
 
-        # TODO do not migrate empty messages?
-        #if body == "":
-        #
-        #    return txnId
+    # if "attachments" in message:
+    #     if message["user"] in userLUT: # ignore attachments from bots
+    #         txnId = process_attachments(message["attachments"], matrix_room, userLUT[message["user"]], body, txnId, config)
+    #         for attachment in message["attachments"]:
+    #             if "is_share" in attachment and attachment["is_share"]:
+    #                 if body:
+    #                     body += "\n"
+    #                 attachment_footer = "no footer"
+    #                 if "footer" in attachment:
+    #                     attachment_footer = attachment["footer"]
+    #                 attachment_text = "no text"
+    #                 if "text" in attachment:
+    #                     attachment_text = attachment["text"]
+    #                 body += "".join(["&gt; _Shared (", attachment_footer, "):_ ", attachment_text, "\n"])
 
-        # replace mentions
-        body = body.replace("<!channel>", "@room");
-        body = body.replace("<!here>", "@room");
-        body = body.replace("<!everyone>", "@room");
-        body = re.sub('<@[A-Z0-9]+>', replace_mention, body)
+    # if "replies" in message: # this is the parent of a thread
+    #     is_thread = True
+    #     previous_message = None
+    #     for reply in message["replies"]:
+    #         if "user" in message and "ts" in message:
+    #             first_message = message["user"]+message["ts"]
+    #             current_message = reply["user"]+reply["ts"]
+    #             if not previous_message:
+    #                 previous_message = first_message
+    #             replyLUT[current_message] = previous_message
+    #             if config_yaml["threads-reply-to-previous"]:
+    #                 previous_message = current_message
 
-        if "files" in message:
-            if "subtype" in message:
-                log.info(message["subtype"])
-                if message["subtype"] == "file_comment" or message["subtype"] == "thread_broadcast":
-                    #TODO treat as reply
-                    log.info("")
-                else:
-                    txnId = process_files(message["files"], matrix_room, userLUT[message["user"]], body, txnId, config)
-            else:
-                txnId = process_files(message["files"], matrix_room, userLUT[message["user"]], body, txnId, config)
+    # replys / threading
+    # if "thread_ts" in message and "parent_user_id" in message and not "replies" in message: # this message is a reply to another message
+    #     is_reply = True
+    #     if not message["user"]+message["ts"] in replyLUT:
+    #         # seems like we don't know the thread yet, save event for later
+    #         if not is_later:
+    #             later.append(message)
+    #         return txnId
+    #     slack_event_id = replyLUT[message["user"]+message["ts"]]
+    #     matrix_event_id = eventLUT[slack_event_id]
 
-        if "attachments" in message:
-            if message["user"] in userLUT: # ignore attachments from bots
-                txnId = process_attachments(message["attachments"], matrix_room, userLUT[message["user"]], body, txnId, config)
-                for attachment in message["attachments"]:
-                    if "is_share" in attachment and attachment["is_share"]:
-                        if body:
-                            body += "\n"
-                        attachment_footer = "no footer"
-                        if "footer" in attachment:
-                            attachment_footer = attachment["footer"]
-                        attachment_text = "no text"
-                        if "text" in attachment:
-                            attachment_text = attachment["text"]
-                        body += "".join(["&gt; _Shared (", attachment_footer, "):_ ", attachment_text, "\n"])
+    # TODO pinned / stared items?
 
-        if "replies" in message: # this is the parent of a thread
-            is_thread = True
-            previous_message = None
-            for reply in message["replies"]:
-                if "user" in message and "ts" in message:
-                    first_message = message["user"]+message["ts"]
-                    current_message = reply["user"]+reply["ts"]
-                    if not previous_message:
-                        previous_message = first_message
-                    replyLUT[current_message] = previous_message
-                    if config_yaml["threads-reply-to-previous"]:
-                        previous_message = current_message
+    # replace emojis
+    body = emojize(body, language='alias')
 
-        # replys / threading
-        if "thread_ts" in message and "parent_user_id" in message and not "replies" in message: # this message is a reply to another message
-            is_reply = True
-            if not message["user"]+message["ts"] in replyLUT:
-                # seems like we don't know the thread yet, save event for later
-                if not is_later:
-                    later.append(message)
-                return txnId
-            slack_event_id = replyLUT[message["user"]+message["ts"]]
-            matrix_event_id = eventLUT[slack_event_id]
+    # TODO some URLs with special characters (e.g. _ ) are parsed wrong
+    # formatted_body = slackdown.render(body)
+    formatted_body = body
 
-        # TODO pinned / stared items?
-
-        # replace emojis
-        body = emojize(body, language='alias')
-
-        # TODO some URLs with special characters (e.g. _ ) are parsed wrong
-        formatted_body = slackdown.render(body)
-
-        if not is_reply:
-            content = {
-                    "body": body,
-                    "msgtype": "m.text",
-                    "format": "org.matrix.custom.html",
-                    "formatted_body": formatted_body,
-            }
-        else:
-            replyEvent = threadLUT[message["parent_user_id"]+message["thread_ts"]]
-            fallbackHtml = getFallbackHtml(matrix_room, replyEvent);
-            fallbackText = getFallbackText(replyEvent);
-            body = fallbackText + "\n\n" + body
-            formatted_body = fallbackHtml + formatted_body
-            content = {
-                "m.relates_to": {
-                    "m.in_reply_to": {
-                        "event_id": matrix_event_id,
-                    },
-                },
-                "msgtype": "m.text",
+    if not is_reply:
+        content = {
                 "body": body,
+                "msgtype": "m.text",
                 "format": "org.matrix.custom.html",
                 "formatted_body": formatted_body,
-            }
+        }
+    else:
+        replyEvent = threadLUT[message["parent_user_id"]+message["thread_ts"]]
+        fallbackHtml = getFallbackHtml(matrix_room, replyEvent);
+        fallbackText = getFallbackText(replyEvent);
+        body = fallbackText + "\n\n" + body
+        formatted_body = fallbackHtml + formatted_body
+        content = {
+            "m.relates_to": {
+                "m.in_reply_to": {
+                    "event_id": matrix_event_id,
+                },
+            },
+            "msgtype": "m.text",
+            "body": body,
+            "format": "org.matrix.custom.html",
+            "formatted_body": formatted_body,
+        }
 
+    if not config["dry-run"]:
         # send message
         ts = message["ts"].replace(".", "")[:-3]
         res = send_event(config, content, matrix_room, userLUT[message["user"]], "m.room.message", txnId, ts)
@@ -788,38 +742,24 @@ def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
                         send_reaction(config, roomId, eventId, emojize(reaction["name"], language='alias'), userLUT[user], txnId)
                         txnId = txnId + 1
 
-    else:
-        log.info("Ignoring message type " + message["type"])
     return txnId
 
-def migrate_messages(fileList, matrix_room, config, tick, log):
+
+def migrate_messages(messageList, matrix_room, config, log):
     log.debug('start migration of messages for matrix room: {}'.format(matrix_room))
     global later
-    
-    archive = zipfile.ZipFile(config["zipfile"], 'r')
     txnId = 1
-    progress = 0
 
-    with alive_bar(bar = 'checks', spinner = 'waves2', manual=True) as bar:
-        for file in fileList:
-            log.debug("prcessing file {}".format(file))
+    with alive_bar(len(messageList), bar='checks', spinner='waves2', force_tty=True) as bar:
+        for message in messageList:
             try:
-                fileData = archive.open(file)
-                messageData = json.load(fileData)
+                txnId = parse_and_send_message(config, message, matrix_room, txnId, False, log)
             except:
-                log.info("Warning: Couldn't load data from file " + file + " in archive. Skipping this file.")
-
-            for message in messageData:
-                try:
-                    txnId = parse_and_send_message(config, message, matrix_room, txnId, False, log)
-                except:
-                    log.error(
-                        "Warning: Couldn't send  message: {} to matrix_room {} id:{}".format(message, matrix_room, txnId)
-                    )
-
-            progress = progress + tick
+                log.error(
+                    "Warning: Couldn't send  message: {} to matrix_room {} id:{}".format(message, matrix_room, txnId)
+                )
             # update_progress(progress)
-            bar(progress)
+            bar()
 
     # process postponed messages
     for message in later:
@@ -827,6 +767,7 @@ def migrate_messages(fileList, matrix_room, config, tick, log):
 
     # clean up postponed messages
     later = []
+
 
 def kick_imported_users(server_location, admin_user, access_token, tick):
     headers = {'Authorization': ' '.join(['Bearer', access_token])}
@@ -871,9 +812,13 @@ def main():
     jsonFiles = loadZip(config)
 
     # login with admin user to gain access token
-    admin_user, access_token = login(config["homeserver"])
-
-    maxUploadSize = getMaxUploadSize(config, access_token)
+    if not config["dry-run"]:
+        admin_user, access_token = login(config["homeserver"])
+        maxUploadSize = getMaxUploadSize(config, access_token)
+    else:
+        admin_user = "DRYRUNADMIN"
+        access_token = "DRYRUNTOKEN"
+        maxUploadSize = 99999999
     config["maxUploadSize"] = maxUploadSize
     config["admin_user"] = admin_user
     log.info("maxUploadSize {}".format(maxUploadSize))
@@ -899,22 +844,6 @@ def main():
             log.info("Creating channels")
         roomlist_channels = migrate_rooms(jsonFiles["rocketchat_room"], jsonFiles["rocketchat_subscription"], config, admin_user)
 
-    # Slack groups
-    if "groups" in jsonFiles and not roomLUT:
-        if not config["run-unattended"]:
-            input('Creating groups. Press enter to proceed\n')
-        else:
-            log.info("Creating groups")
-        roomlist_groups = migrate_rooms(jsonFiles["groups.json"], jsonFiles["rocketchat_subscription"], config, admin_user)
-
-    # create DMs
-    if "dms" in jsonFiles and not dmLUT:
-        if not config["run-unattended"]:
-            input('Creating DMs. Press enter to proceed\n')
-        else:
-            log.info("Creating DMs")
-        roomlist_dms = migrate_dms(jsonFiles["dms.json"], config, admin_user)
-
     # write LUTs to file to be able to load from later if something goes wrong
     if not read_luts:
         data = dict(
@@ -922,7 +851,6 @@ def main():
             nameLUT = nameLUT,
             roomLUT = roomLUT,
             roomLUT2 = roomLUT2,
-            dmLUT = dmLUT,
             # users = userlist,
         )
         with open('run/luts.yaml', 'w+') as outfile:
@@ -933,27 +861,15 @@ def main():
         input('Migrating messages to rooms. This may take a while. Press enter to proceed\n')
     else:
         log.info("Migrating messages to rooms. This may take a while...")
-    for slack_room, matrix_room in roomLUT.items():
-        log = logging.getLogger('ROCKETCHAT.MIGRATE.MESSAGES.{}'.format(roomLUT2[slack_room]))
-        log.info("Migrating messages for room: " + roomLUT2[slack_room])
-        fileList = sorted(loadZipFolder(config, roomLUT2[slack_room]))
-        if fileList:
-            tick = 1/len(fileList)
-            migrate_messages(fileList, matrix_room, config, tick, log)
 
-    # clean up postponed messages
-    later = []
+    messageData = decodeBson(jsonFiles["rocketchat_message"])
 
-    # send events to dms
-    if not config["run-unattended"]:
-        input('Migrating messages to DMs. This may take a while. Press enter to proceed\n')
-    else:
-        log.info("Migrating messages to DMs. This may take a while...")
-    for slack_room, matrix_room in dmLUT.items():
-        fileList = sorted(loadZipFolder(config, slack_room))
-        if fileList:
-            tick = 1/len(fileList)
-            migrate_messages(fileList, matrix_room, config, tick, log)
+    for rocketchat_room, matrix_room in roomLUT.items():
+        log = logging.getLogger('ROCKETCHAT.MIGRATE.MESSAGES.{}'.format(roomLUT2[rocketchat_room]))
+        log.info("Migrating messages for room: " + roomLUT2[rocketchat_room])
+        messageList = [message for message in messageData if message["rid"] == rocketchat_room]
+        if messageList:
+            migrate_messages(messageList, matrix_room, config, log)
 
     # clean up postponed messages
     later = []
