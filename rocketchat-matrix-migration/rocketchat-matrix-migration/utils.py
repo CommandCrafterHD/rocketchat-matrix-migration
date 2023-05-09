@@ -57,7 +57,7 @@ def send_event(
             "Logging an uncaught exception {}".format(e),
             exc_info=(traceback)
         )
-        log.debug("error creating room {}".format(body))
+        log.debug("error creating room {}".format(r))
         return False
     else:
         if r.status_code != 200:
@@ -66,7 +66,7 @@ def send_event(
                 invite_user(
                     matrix_room,
                     matrix_user_id,
-                    conf
+                    config
                 )
                 try:
                     r = requests.put(url, headers={'Authorization': 'Bearer ' + config["as_token"]}, json=matrix_message, verify=config["verify-ssl"])
@@ -76,7 +76,7 @@ def send_event(
                         "Logging an uncaught exception {}".format(e),
                         exc_info=(traceback)
                     )
-                    log.debug("error creating room {}".format(body))
+                    log.debug("error creating room {}".format(r))
                     return False
                 else:
                     if r.status_code == 200:

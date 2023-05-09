@@ -14,6 +14,8 @@ zipfile: /data/Slack_Export.zip
 dry-run: False
 # Set to 'True' to run without asking for confirmation after each step
 run-unattended: False
+# If you want to use multithreading to migrate messages, specify how many thread workers you want to import messages (set to 1 if you want to import one channel at a time)
+message-migration-threads: 5
 # Set to 'False' if archived Channels from Slack should be migrated (and accessible in Matrix)
 skip-archived: True
 # Set to 'True' to invite all users to all rooms ( Very slow on rooms creator whit many users )

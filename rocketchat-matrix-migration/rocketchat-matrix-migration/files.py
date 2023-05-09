@@ -51,11 +51,11 @@ log.addHandler(fileHandler)
  * @return {Object} Matrix event content, as per https://matrix.org/docs/spec/#m-image
 '''
 
-def slackImageToMatrixImage(file, url, thumbnailUrl):
+def rocketchatImageToMatrixImage(file, url):
     message = {
         "body": file["title"],
         "info": {
-            "mimetype": file["mimetype"],
+            "mimetype": file["type"],
             "size": file["size"],
         },
         "msgtype": "m.image",
@@ -63,20 +63,20 @@ def slackImageToMatrixImage(file, url, thumbnailUrl):
         # TODO: Define some matrix types
     }
 
-    if "original_w" in file:
-        message["info"]["w"] = file["original_w"]
+    if "width" in file["identify"]:
+        message["info"]["w"] = file["identify"]["width"]
 
-    if "original_h" in file:
-        message["info"]["h"] = file["original_h"]
+    if "height" in file["identify"]:
+        message["info"]["h"] = file["identify"]["height"]
 
-    if thumbnailUrl:
-        message["thumbnail_url"] = thumbnailUrl
-        message["thumbnail_info"] = {}
-        if "thumb_360_w" in file:
-            message["thumbnail_info"]["w"] = file["thumb_360_w"]
+    # if thumbnailUrl:
+    #     message["thumbnail_url"] = thumbnailUrl
+    #     message["thumbnail_info"] = {}
+    #     if "thumb_360_w" in file:
+    #         message["thumbnail_info"]["w"] = file["thumb_360_w"]
 
-        if "thumb_360_h" in file:
-            message["thumbnail_info"]["h"] = file["thumb_360_h"]
+    #     if "thumb_360_h" in file:
+    #         message["thumbnail_info"]["h"] = file["thumb_360_h"]
 
     return message
 
@@ -94,11 +94,11 @@ def slackImageToMatrixImage(file, url, thumbnailUrl):
  * @return Matrix event content, as per https://matrix.org/docs/spec/client_server/r0.4.0.html#m-video
 '''
 
-def slackImageToMatrixVideo(file, url, thumbnailUrl):
+def rocketchatVideoToMatrixVideo(file, url):
     message = {
-        "body": file["title"],
+        "body": file["name"],
         "info": {
-            "mimetype": file["mimetype"],
+            "mimetype": file["type"],
             "size": file["size"],
         },
         "msgtype": "m.video",
@@ -106,16 +106,11 @@ def slackImageToMatrixVideo(file, url, thumbnailUrl):
         # TODO: Define some matrix types
     }
 
+    if "width" in file["identify"]:
+        message["info"]["w"] = file["identify"]["width"]
 
-    if "original_w" in file:
-        message["info"]["w"] = file["original_w"]
-
-    if "original_h" in file:
-        message["info"]["h"] = file["original_h"]
-
-    if thumbnailUrl:
-        message["thumbnail_url"] = thumbnailUrl
-        # Slack don't tell us the thumbnail size for videos. Boo
+    if "height" in file["identify"]:
+        message["info"]["h"] = file["identify"]["height"]
 
     return message
 
@@ -130,11 +125,11 @@ def slackImageToMatrixVideo(file, url, thumbnailUrl):
  * @return {Object} Matrix event content, as per https://matrix.org/docs/spec/client_server/r0.4.0.html#m-audio
 '''
 
-def slackImageToMatrixAudio(file, url):
+def rocketchatAudioToMatrixAudio(file, url):
     return {
-        "body": file["title"],
+        "body": file["name"],
         "info": {
-            "mimetype": file["mimetype"],
+            "mimetype": file["type"],
             "size": file["size"],
         },
         "msgtype": "m.audio",
@@ -142,27 +137,27 @@ def slackImageToMatrixAudio(file, url):
     }
 
 '''
- * Converts a slack file upload to a matrix file upload event.
+ * Converts a rocketchat file upload to a matrix file upload event.
  *
- * @param file The slack file object.
+ * @param file The rocketchat file object.
  * @param url The matrix file mxc.
  * @param thumbnail_url The matrix thumbnail mxc.
  * @return Matrix event content, as per https://matrix.org/docs/spec/#m-file
 '''
 
-def slackFileToMatrixMessage(file, url, thumbnailUrl):
-    if "mimetype" in file:
-        if file["mimetype"].startswith("image/"):
-            return slackImageToMatrixImage(file, url, thumbnailUrl)
-        if file["mimetype"].startswith("video/"):
-                return slackImageToMatrixVideo(file, url, thumbnailUrl)
-        if file["mimetype"].startswith("audio/"):
-            return slackImageToMatrixAudio(file, url)
+def rocketchatFileToMatrixMessage(file, url):
+    if "type" in file:
+        if file["type"].startswith("image/"):
+            return rocketchatImageToMatrixImage(file, url)
+        if file["type"].startswith("video/"):
+                return rocketchatVideoToMatrixVideo(file, url)
+        if file["type"].startswith("audio/"):
+            return rocketchatAudioToMatrixAudio(file, url)
 
     return  {
-        "body": file["title"],
+        "body": file["name"],
         "info": {
-            "mimetype": file["mimetype"],
+            "mimetype": file["type"],
             "size": file["size"],
         },
         "msgtype": "m.file",
@@ -170,6 +165,7 @@ def slackFileToMatrixMessage(file, url, thumbnailUrl):
     }
 
 def uploadContentFromURI(content, uri, config, user):
+
     res = requests.get(uri)
     if res.status_code != 200:
         log.info("ERROR! Received %d %s" % (res.status_code, res.reason))
@@ -209,9 +205,10 @@ def process_attachments(attachments, roomId, userId, body, txnId, config):
         txnId = process_file(file, roomId, userId, body, txnId, config)
     return txnId
 
-def process_files(files, roomId, userId, body, txnId, config):
+def process_files(files, roomId, userId, body, txnId, config, fileMappings):
     for file in files:
-        txnId = process_file(file, roomId, userId, body, txnId, config)
+        if file["_id"] in fileMappings.keys():
+            txnId = process_file(fileMappings[file["_id"]], roomId, userId, body, txnId, config)
     return txnId
 
 def get_link(file):
@@ -266,38 +263,39 @@ def process_snippet(file, roomId, userId, body, txnId, config, ts):
 
 def process_upload(file, roomId, userId, body, txnId, config, ts):
     if "maxUploadSize" in config and file["size"] > config["maxUploadSize"]:
-        link = get_link(file)
-        log.info("WARNING: File too large, sending as a link: " + link);
-        messageContent = {
-            "body": link + '(' + file["name"] + ')',
-            "format": "org.matrix.custom.html",
-            "formatted_body": '<a href="' + link + '">' + file["name"] + '</a>',
-            "msgtype": "m.text",
-        }
-        res = send_event(config, messageContent, roomId, userId, "m.room.message", txnId, ts)
-        if res == False:
-            log.info("ERROR while sending file link to room '" + roomId)
+        log.error(f"File {file['name']} too big. Aborting.")
+        # link = get_link(file)
+        # log.info("WARNING: File too large, sending as a link: " + link);
+        # messageContent = {
+        #     "body": link + '(' + file["name"] + ')',
+        #     "format": "org.matrix.custom.html",
+        #     "formatted_body": '<a href="' + link + '">' + file["name"] + '</a>',
+        #     "msgtype": "m.text",
+        # }
+        # res = send_event(config, messageContent, roomId, userId, "m.room.message", txnId, ts)
+        # if res == False:
+        #     log.info("ERROR while sending file link to room '" + roomId)
 
     else:
-        thumbUri = ""
-        thumbnailContentUri=""
+        # thumbUri = ""
+        # thumbnailContentUri=""
 
-        if "thumb_video" in file:
-            thumbUri = file["thumb_video"]
-        if "thumb_360" in file:
-            thumbUri = file["thumb_360"]
+        # if "thumb_video" in file:
+        #     thumbUri = file["thumb_video"]
+        # if "thumb_360" in file:
+        #     thumbUri = file["thumb_360"]
 
-        if thumbUri and "filetype" in file:
-            content = {
-                "mimetype": file["mimetype"],
-                "title": file["name"] + '_thumb' + file["filetype"],
-            }
+        # if thumbUri and "filetype" in file:
+        #     content = {
+        #         "mimetype": file["mimetype"],
+        #         "title": file["name"] + '_thumb' + file["filetype"],
+        #     }
 
-            thumbnailContentUri = uploadContentFromURI(content, thumbUri, config, userId)
+        #     thumbnailContentUri = uploadContentFromURI(content, thumbUri, config, userId)
 
-        fileContentUri = uploadContentFromURI({"title": file["title"], "mimetype": file["mimetype"]}, file["url_private"], config, userId)
+        fileContentUri = uploadContentFromURI({"title": file["name"], "mimetype": file["type"]}, file["path"], config, userId)
 
-        messageContent = slackFileToMatrixMessage(file, fileContentUri, thumbnailContentUri)
+        messageContent = rocketchatFileToMatrixMessage(file, fileContentUri)
 
         res = send_event(config, messageContent, roomId, userId, "m.room.message", txnId, ts)
         if res == False:
@@ -307,16 +305,20 @@ def process_upload(file, roomId, userId, body, txnId, config, ts):
     return txnId
 
 def process_file(file, roomId, userId, body, txnId, config):
-    if not "url_private" in file:
+    if not "identify" in file and not "path" in file["identify"]:
         # we have no url to process the file
         return txnId
 
-    ts = str(file["timestamp"]) + "000"
+    if file["store"] != "FileSystem:Uploads":
+        # todo: we can't process non FileSystem files (yet)
+        return txnId
 
-    if file["mode"] == "snippet":
-        txnId = process_snippet(file, roomId, userId, body, txnId, config, ts)
-    else:
-        txnId = process_upload(file, roomId, userId, body, txnId, config, ts)
+    ts = str(file["uploadedAt"]) + "000"
+
+    # if file["mode"] == "snippet":
+    #     txnId = process_snippet(file, roomId, userId, body, txnId, config, ts)
+    # else:
+    txnId = process_upload(file, roomId, userId, body, txnId, config, ts)
 
     txnId = txnId + 1
     return txnId

@@ -25,6 +25,8 @@ import traceback
 import zipfile
 import gzip
 import bson
+import queue
+import threading
 
 import requests
 import yaml
@@ -33,6 +35,7 @@ from emoji import emojize
 from files import process_attachments, process_files
 from alive_progress import alive_bar
 from utils import send_event, invite_user
+from datetime import datetime
 
 LOG_LEVEL = os.environ.get('LOG_LEVEL', "INFO").upper()
 ADMIN_USER_MATRIX = os.environ.get('ADMIN_USER_MATRIX')
@@ -51,7 +54,7 @@ log.addHandler(fileHandler)
 # log.addHandler(consoleHandler)
 
 
-channelTypes = ["users.bson.gz", "rocketchat_message.bson.gz", "rocketchat_room.bson.gz", "rocketchat_subscription.bson.gz"]
+channelTypes = ["users.bson.gz", "rocketchat_message.bson.gz", "rocketchat_room.bson.gz", "rocketchat_subscription.bson.gz", "rocketchat_uploads.bson.gz"]
 userLUT = {}
 nameLUT = {}
 roomLUT = {}
@@ -60,6 +63,9 @@ eventLUT = {}
 threadLUT = {}
 replyLUT = {}
 later = []
+jsonFiles = {}
+uploadMappings = {}
+workerQueue = queue.Queue()
 read_luts = False
 
 if not os.path.isfile("conf/config.yaml"):
@@ -93,6 +99,10 @@ def test_config(yaml):
         log.info("No Application Service token defined in config")
         sys.exit(1)
 
+    if not config_yaml["message-migration-threads"] or config_yaml["message-migration-threads"] <= 0:
+        log.info("Message thread worker count set too low")
+        sys.exit(1)
+
     dry_run = config_yaml["dry-run"]
     skip_archived = config_yaml["skip-archived"]
 
@@ -108,6 +118,8 @@ def loadZip(config):
     for channelType in channelTypes:
         try:
             jsonFiles[channelType.split(".")[0]] = gzip.decompress(archive.open(channelType).read())
+            if channelType.split(".")[0] == "rocketchat_uploads":
+                uploadMappings = decodeBson(jsonFiles["rocketchat_uploads"])
             log.info("Found " + channelType.split(".")[0] + " in archive. Adding.")
         except:
             log.info("Warning: Couldn't find " + channelType.split(".")[0] + " in archive. Skipping.")
@@ -242,7 +254,7 @@ def register_user(
     user_type=None,
 ):
 
-    url = "%s/_synapse/admin/v2/users/@%s:%s" % (server_location, user, config_yaml['domain'])
+    url = "%s/_synapse/admin/v2/users/@%s:%s" % (server_location, str.lower(user), config_yaml['domain'])
 
     headers = {'Authorization': ' '.join(['Bearer', access_token])}
 
@@ -378,7 +390,9 @@ def migrate_users(userFile, config, access_token):
                 bar()
                 continue
 
-            _servername = config["homeserver"].split('/')[2]
+            user["username"] = str.lower(user["username"])
+
+            _servername = config["domain"]
             _matrix_user = user["username"]
             _matrix_id = '@' + user["username"] + ':' + _servername
 
@@ -410,7 +424,7 @@ def migrate_users(userFile, config, access_token):
                 "matrix_password": _password,
             }
 
-            log.info("Registering RocketChat user " + userDetails["rocketchat_id"] + " -> " + userDetails["matrix_id"])
+            # log.info("Registering RocketChat user " + userDetails["rocketchat_id"] + " -> " + userDetails["matrix_id"])
             if not config["dry-run"]:
                 res = register_user(userDetails["matrix_user"], userDetails["matrix_password"], userDetails["rocketchat_real_name"], config["homeserver"], access_token)
                 if res == False:
@@ -445,10 +459,16 @@ def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
                 _invitees = []
                 if channel["t"] == "c":
                     for subscription in [sub for sub in subscriptionData if sub["t"] == "c" and sub["rid"] == channel["_id"]]:
-                        _invitees.append(subscription["u"]["_id"])
+                        if subscription["u"]["_id"] in userLUT:
+                            _invitees.append(userLUT[subscription["u"]["_id"]])
+                        else:
+                            log.warning(f'USER ID {subscription["u"]["_id"]} not found in userLUT. Skipping.')
                 else:
                     for subscription in [sub for sub in subscriptionData if sub["t"] == "p" and sub["rid"] == channel["_id"]]:
-                        _invitees.append(subscription["u"]["_id"])
+                        if subscription["u"]["_id"] in userLUT:
+                            _invitees.append(userLUT[subscription["u"]["_id"]])
+                        else:
+                            log.warning(f'USER ID {subscription["u"]["_id"]} not found in userLUT. Skipping.')
 
                 if config_yaml["create-as-admin"]:
                     _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
@@ -470,10 +490,13 @@ def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
                     "matrix_topic": '',
                 }
             elif channel["t"] == "d":  # Direct messages
-                room_preset = "private_chat"
+                room_preset = "trusted_private_chat"
                 _invitees = []
                 for subscription in [sub for sub in subscriptionData if sub["t"] == "d" and sub["rid"] == channel["_id"]]:
-                    _invitees.append(subscription["u"]["_id"])
+                    if subscription["u"]["_id"] in userLUT:
+                        _invitees.append(userLUT[subscription["u"]["_id"]])
+                    else:
+                        log.warning(f'USER ID {subscription["u"]["_id"]} not found in userLUT. Skipping.')
 
                 if config_yaml["create-as-admin"]:
                     _mxCreator = "".join(["@", admin_user, ":", config_yaml["domain"]])
@@ -498,6 +521,10 @@ def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
                 bar()
                 continue
 
+            # Make sure we don't have the creator twice
+            if _mxCreator in _invitees:
+                _invitees.remove(_mxCreator)
+
             if not config["dry-run"]:
                 res = register_room(roomDetails["rocketchat_name"], roomDetails["matrix_creator"], roomDetails["matrix_topic"], _invitees, room_preset, config["homeserver"], config["as_token"])
 
@@ -507,7 +534,7 @@ def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
                 else:
                     _content = json.loads(res.content)
                     roomDetails["matrix_id"] = _content["room_id"]
-                log.info("Registered RocketChat channel " + roomDetails["rocketchat_name"] + " -> " + roomDetails["matrix_id"])
+                # log.info("Registered RocketChat channel " + roomDetails["rocketchat_name"] + " -> " + roomDetails["matrix_id"])
 
                 #invite all members
                 if config_yaml["invite-all"]:
@@ -562,39 +589,59 @@ def getFallbackText(replyEvent):
 
 def parse_rocketchat_markdown(md):
     output = ""
-    newLine = '\n'
     for entry in md:
-        if entry['type'] == 'PARAGRAPH':
-            for value in entry['value']:
-                if value['type'] == 'PLAIN_TEXT':
-                    output += value['value']
-                elif value['type'] == 'MENTION_USER':
-                    output += f"@{value['value']['value']}:{config_yaml['domain']}"
-                elif value['type'] == 'LINK':
-                    if value['value']['label']['value'] == ' ':  # This is a reply.
-                        # TODO: Figure out how to work with reply links
-                        continue
-                    output += f"[{value['value']['label']['value'] if value['value']['label']['value'] != '' else value['value']['src']['value']}]({value['value']['src']['value']})"  # Format links in [<LABEL>](<URL>) format. Replace the label with the URL if no label is given
-                elif value['type'] == 'EMOJI':
-                    output += f":{value['shortCode']}:"
-                elif value['type'] == 'INLINE_CODE':
-                    output += f"`{value['value']['value']}`"
-                elif value['type'] == 'BOLD':
-                    for string in entry['value']:
-                        output += f"{string['value']}"
-                else:
-                    log.info(f"Unsupported markdown-value type: {value['type']}")
-                    continue
-        elif entry['type'] == 'CODE':
-            output += f"\n```{entry['language']}\n{(line['value']['value'] + newLine for line in entry['value'])}```\n"
-        elif entry['type'] == 'LINE_BREAK':
-            output += '\n'
-        elif entry['type'] == 'BIG_EMOJI':
-            for emoji in entry['value']:
-                output += f":{emoji['value']['value']}: "
+        output += parse_rocketchat_markdown_value(entry)
+
+    return output
+
+"""
+This function might already be deprecated.
+"""
+def parse_rocketchat_markdown_value(value):
+    output = ""
+    newline = '\n'
+    if value['type'] == 'PLAIN_TEXT':
+        output += value['value']
+    elif value['type'] == 'MENTION_USER':
+        output += f"@{value['value']['value']}:{config_yaml['domain']}"
+    elif value['type'] == 'LINK':
+        if value['value']['label']['value'] == ' ':  # This is a reply.
+            pass
+            # TODO: Figure out how to work with reply links
         else:
-            log.info(f"Unsupported markdown type: {entry['type']}")
-            continue
+            output += f"[{value['value']['label']['value'] if value['value']['label']['value'] != '' else value['value']['src']['value']}]({value['value']['src']['value']})"  # Format links in [<LABEL>](<URL>) format. Replace the label with the URL if no label is given
+    elif value['type'] == 'EMOJI':
+        output += f":{value['shortCode']}:"
+    elif value['type'] == 'INLINE_CODE':
+        output += f"`{value['value']['value']}`"
+    elif value['type'] == 'BOLD':
+        for _value in value['value']:
+            output += parse_rocketchat_markdown_value(_value)
+    elif value['type'] == 'PARAGRAPH':
+        for _value in value['value']:
+            output += parse_rocketchat_markdown_value(_value)
+    elif value['type'] == 'QUOTE':
+        for _value in value['value']:
+            output += f">{parse_rocketchat_markdown_value(_value)}"
+    elif value['type'] == 'MENTION_CHANNEL':
+        for _value in value['value']:
+            output += f"#{parse_rocketchat_markdown_value(_value)}"
+    elif value['type'] == 'CODE':
+        output += "\n```"
+        for _value in value['value']:
+            output += parse_rocketchat_markdown_value(_value)
+        output += "```\n"
+    elif value['type'] == "CODE_LINE":
+        for _value in value['value']:
+            output += parse_rocketchat_markdown_value(_value)
+        output += "\n"
+    elif value['type'] == 'LINE_BREAK':
+        output += '\n'
+    elif value['type'] == 'BIG_EMOJI':
+        for emoji in value['value']:
+            output += f":{emoji['value']['value']}: "
+    else:
+        log.info(f"Unsupported markdown-value type: {value['type']}")
 
     return output
 
@@ -617,7 +664,8 @@ def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
         log.info("Message without user, thanks rocketchat")
         log.info(message)
 
-    body = parse_rocketchat_markdown(message['md'])
+    # body = parse_rocketchat_markdown(message['md'])
+    body = message['msg']
 
     # TODO do not migrate empty messages?
     #if body == "":
@@ -625,21 +673,13 @@ def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
     #    return txnId
 
     # replace mentions
-    body = body.replace("<!channel>", "@room")
-    body = body.replace("<!here>", "@room")
-    body = body.replace("<!everyone>", "@room")
+    body = body.replace("@all", "@room")
+    body = body.replace("@here", "@room")
     body = re.sub('<@[A-Z0-9]+>', replace_mention, body)
 
-    # if "files" in message:
-    #     if "subtype" in message:
-    #         log.info(message["subtype"])
-    #         if message["subtype"] == "file_comment" or message["subtype"] == "thread_broadcast":
-    #             #TODO treat as reply
-    #             log.info("")
-    #         else:
-    #             txnId = process_files(message["files"], matrix_room, userLUT[message["user"]], body, txnId, config)
-    #     else:
-    #         txnId = process_files(message["files"], matrix_room, userLUT[message["user"]], body, txnId, config)
+    # todo: Test this
+    # if "attachments" in message:
+    #     txnId = process_files(message["files"], matrix_room, userLUT[message["user"]], body, txnId, config, uploadMappings)
 
     # if "attachments" in message:
     #     if message["user"] in userLUT: # ignore attachments from bots
@@ -716,33 +756,43 @@ def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
 
     if not config["dry-run"]:
         # send message
-        ts = message["ts"].replace(".", "")[:-3]
-        res = send_event(config, content, matrix_room, userLUT[message["user"]], "m.room.message", txnId, ts)
+        ts = int(datetime.utcfromtimestamp(message["ts"].timestamp()).timestamp() * 1e3)
+        # ts = int(message["ts"].timestamp() * 1e3)
+        res = send_event(config, content, matrix_room, userLUT[message["u"]["_id"]], "m.room.message", txnId, ts)
         # save event id
-        if res == False:
+        if not res:
             log.info("ERROR while sending event '" + message["user"] + " " + message["ts"] + "'")
             log.error("ERROR body {}".format(body))
             log.error("ERROR formatted_body {}".format(formatted_body))
         else:
             _content = json.loads(res.content)
             # use "user" combined with "ts" as id like Slack does as "client_msg_id" is not always set
-            if "user" in message and "ts" in message:
-                eventLUT[message["user"]+message["ts"]] = _content["event_id"]
+            if "u" in message and ts:
+                eventLUT[message["u"]["_id"]+str(ts)] = _content["event_id"]
             txnId = txnId + 1
             if is_thread:
-                threadLUT[message["user"]+message["ts"]] = {"body": body, "formatted_body": formatted_body, "sender": userLUT[message["user"]], "event_id": _content["event_id"]}
+                threadLUT[message["u"]["_id"]+str(ts)] = {"body": body, "formatted_body": formatted_body, "sender": userLUT[message["u"]["_id"]], "event_id": _content["event_id"]}
 
             # handle reactions
             if "reactions" in message:
                 roomId = matrix_room
-                eventId = eventLUT[message["user"]+message["ts"]]
-                for reaction in message["reactions"]:
-                    for user in reaction["users"]:
+                eventId = eventLUT[message["u"]["_id"]+str(ts)]
+                for emoji in message["reactions"].keys():
+                    for user in message["reactions"][emoji]["usernames"]:
                         #log.info("Send reaction in room " + roomId)
-                        send_reaction(config, roomId, eventId, emojize(reaction["name"], language='alias'), userLUT[user], txnId)
+                        send_reaction(config, roomId, eventId, emojize(emoji, language='alias'), f"@{user}:{config['domain']}", txnId)
                         txnId = txnId + 1
 
     return txnId
+
+def migrate_messages_worker():
+    while True:
+        channel = workerQueue.get(block=True)
+        # channel["log"].info(f"Migrating room {channel['matrix_room']}")
+        if channel["messageList"]:
+            migrate_messages(channel["messageList"], channel["matrix_room"], config_yaml, channel["log"])
+        channel["bar"](1)
+        workerQueue.task_done()
 
 
 def migrate_messages(messageList, matrix_room, config, log):
@@ -750,16 +800,16 @@ def migrate_messages(messageList, matrix_room, config, log):
     global later
     txnId = 1
 
-    with alive_bar(len(messageList), bar='checks', spinner='waves2', force_tty=True) as bar:
-        for message in messageList:
-            try:
-                txnId = parse_and_send_message(config, message, matrix_room, txnId, False, log)
-            except:
-                log.error(
-                    "Warning: Couldn't send  message: {} to matrix_room {} id:{}".format(message, matrix_room, txnId)
-                )
-            # update_progress(progress)
-            bar()
+    # with alive_bar(len(messageList), bar='checks', spinner='waves2', force_tty=True) as bar:
+    for message in messageList:
+        try:
+            txnId = parse_and_send_message(config, message, matrix_room, txnId, False, log)
+        except:
+            log.error(
+                "Warning: Couldn't send  message: {} to matrix_room {} id:{}".format(message, matrix_room, txnId)
+            )
+        # update_progress(progress)
+        # bar()
 
     # process postponed messages
     for message in later:
@@ -809,6 +859,7 @@ def main():
 
     config = test_config(yaml)
 
+    global jsonFiles
     jsonFiles = loadZip(config)
 
     # login with admin user to gain access token
@@ -864,12 +915,28 @@ def main():
 
     messageData = decodeBson(jsonFiles["rocketchat_message"])
 
-    for rocketchat_room, matrix_room in roomLUT.items():
-        log = logging.getLogger('ROCKETCHAT.MIGRATE.MESSAGES.{}'.format(roomLUT2[rocketchat_room]))
-        log.info("Migrating messages for room: " + roomLUT2[rocketchat_room])
-        messageList = [message for message in messageData if message["rid"] == rocketchat_room]
-        if messageList:
-            migrate_messages(messageList, matrix_room, config, log)
+    with alive_bar(len(roomLUT.items()), bar='checks', spinner='waves2', force_tty=True) as bar:
+        for rocketchat_room, matrix_room in roomLUT.items():
+            log = logging.getLogger('ROCKETCHAT.MIGRATE.MESSAGES.{}'.format(roomLUT2[rocketchat_room]))
+            messageList = [message for message in messageData if message["rid"] == rocketchat_room]
+            log.info("Queueing up room: " + roomLUT[rocketchat_room])
+            workerQueue.put(item={
+                "messageList": messageList,
+                "matrix_room": matrix_room,
+                "log": log,
+                "bar": bar
+            })
+            # migrate_messages(messageList, matrix_room, config, log)
+
+        threadcount = config["message-migration-threads"]
+        threads = []
+
+        for i in range(threadcount):
+            # Create worker threads.
+            log.info(f"Creating worker thread [{i}]")
+            threads.append(threading.Thread(target=migrate_messages_worker, daemon=True).start())
+
+        workerQueue.join()
 
     # clean up postponed messages
     later = []
