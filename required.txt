@@ -3,3 +3,4 @@ requests
 emoji
 bson
 alive_progress
+ijson

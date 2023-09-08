@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import traceback
 import zipfile
@@ -30,12 +31,18 @@ import threading
 
 import requests
 import yaml
-from emoji import emojize
+from emoji import demojize
 
 from files import process_attachments, process_files
 from alive_progress import alive_bar
-from utils import send_event, invite_user
+from utils import send_event, invite_user, fillTable
 from datetime import datetime
+
+con = sqlite3.connect("data/messages.db")
+
+cur = con.cursor()
+
+cur.execute("CREATE TABLE IF NOT EXISTS messages(_id, rid, msg, ts, u)")
 
 LOG_LEVEL = os.environ.get('LOG_LEVEL', "INFO").upper()
 ADMIN_USER_MATRIX = os.environ.get('ADMIN_USER_MATRIX')
@@ -54,7 +61,7 @@ log.addHandler(fileHandler)
 # log.addHandler(consoleHandler)
 
 
-channelTypes = ["users.bson.gz", "rocketchat_message.bson.gz", "rocketchat_room.bson.gz", "rocketchat_subscription.bson.gz", "rocketchat_uploads.bson.gz"]
+channelTypes = ["users.bson.gz", "rocketchat_room.bson.gz", "rocketchat_subscription.bson.gz", "rocketchat_uploads.bson.gz"]
 userLUT = {}
 nameLUT = {}
 roomLUT = {}
@@ -454,7 +461,7 @@ def migrate_rooms(roomFile, subscriptionFile, config, admin_user):
                     bar()
                     continue
 
-            if channel["t"] == "c" or channel["t"] == "p":  # Channels and teams (this are almost identical)
+            if channel["t"] == "c" or channel["t"] == "p":  # Channels and teams (these are almost identical)
                 room_preset = "public_chat" if channel["t"] == "c" else "private_chat"
                 _invitees = []
                 if channel["t"] == "c":
@@ -645,27 +652,25 @@ def parse_rocketchat_markdown_value(value):
 
     return output
 
-def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
+def parse_and_send_message(config, message, txnId, is_later, log):
     content = {}
     is_thread = False
     is_reply = False
 
+    # message object: _id, rid, msg, ts,  u
+    #                 (0)  (1)  (2)  (3) (4)
+
     # ignore hidden messages
     # todo: find out if rocketchat does something like this
-    if "hidden" in message:
-        if message["hidden"] == True:
-            return txnId
-
-    if "u" in message: #TODO what messages have no user?
-        if not message["u"]["_id"] in userLUT:
-            # ignore messages from bots or not already added users
-            return txnId
-    else:
-        log.info("Message without user, thanks rocketchat")
-        log.info(message)
+    # if "hidden" in message:
+    #     if message["hidden"] == True:
+    #         return txnId
+    if not message[4] in userLUT:
+        # ignore messages from bots or not already added users
+        return txnId
 
     # body = parse_rocketchat_markdown(message['md'])
-    body = message['msg']
+    body = message[2]
 
     # TODO do not migrate empty messages?
     #if body == "":
@@ -723,7 +728,7 @@ def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
     # TODO pinned / stared items?
 
     # replace emojis
-    body = emojize(body, language='alias')
+    body = demojize(body, language='alias')
 
     # TODO some URLs with special characters (e.g. _ ) are parsed wrong
     # formatted_body = slackdown.render(body)
@@ -738,7 +743,7 @@ def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
         }
     else:
         replyEvent = threadLUT[message["parent_user_id"]+message["thread_ts"]]
-        fallbackHtml = getFallbackHtml(matrix_room, replyEvent);
+        fallbackHtml = getFallbackHtml(roomLUT[message[1]], replyEvent);
         fallbackText = getFallbackText(replyEvent);
         body = fallbackText + "\n\n" + body
         formatted_body = fallbackHtml + formatted_body
@@ -756,64 +761,68 @@ def parse_and_send_message(config, message, matrix_room, txnId, is_later, log):
 
     if not config["dry-run"]:
         # send message
-        ts = int(datetime.utcfromtimestamp(message["ts"].timestamp()).timestamp() * 1e3)
-        # ts = int(message["ts"].timestamp() * 1e3)
-        res = send_event(config, content, matrix_room, userLUT[message["u"]["_id"]], "m.room.message", txnId, ts)
+        ts = int(message[3])
+        res = send_event(config, content, roomLUT[message[1]], userLUT[message[4]], "m.room.message", txnId, ts)
         # save event id
         if not res:
-            log.info("ERROR while sending event '" + message["user"] + " " + message["ts"] + "'")
+            log.info("ERROR while sending event '" + message[4] + " " + message[3] + "'")
             log.error("ERROR body {}".format(body))
             log.error("ERROR formatted_body {}".format(formatted_body))
         else:
             _content = json.loads(res.content)
             # use "user" combined with "ts" as id like Slack does as "client_msg_id" is not always set
-            if "u" in message and ts:
-                eventLUT[message["u"]["_id"]+str(ts)] = _content["event_id"]
+            eventLUT[message[4]+str(ts)] = _content["event_id"]
             txnId = txnId + 1
             if is_thread:
-                threadLUT[message["u"]["_id"]+str(ts)] = {"body": body, "formatted_body": formatted_body, "sender": userLUT[message["u"]["_id"]], "event_id": _content["event_id"]}
+                threadLUT[message[4]+str(ts)] = {"body": body, "formatted_body": formatted_body, "sender": userLUT[message[4]], "event_id": _content["event_id"]}
 
+
+            # TODO: Add reactions to messages.db
             # handle reactions
-            if "reactions" in message:
-                roomId = matrix_room
-                eventId = eventLUT[message["u"]["_id"]+str(ts)]
-                for emoji in message["reactions"].keys():
-                    for user in message["reactions"][emoji]["usernames"]:
-                        #log.info("Send reaction in room " + roomId)
-                        send_reaction(config, roomId, eventId, emojize(emoji, language='alias'), f"@{user}:{config['domain']}", txnId)
-                        txnId = txnId + 1
+            # if "reactions" in message:
+            #     roomId = roomLUT[message[1]]
+            #     eventId = eventLUT[message[4]+str(ts)]
+            #     for emoji in message["reactions"].keys():
+            #         for user in message["reactions"][emoji]["usernames"]:
+            #             #log.info("Send reaction in room " + roomId)
+            #             send_reaction(config, roomId, eventId, emojize(emoji, language='alias'), f"@{user}:{config['domain']}", txnId)
+            #             txnId = txnId + 1
 
     return txnId
 
+
 def migrate_messages_worker():
     while True:
-        channel = workerQueue.get(block=True)
+        task = workerQueue.get(block=True)
+        _con = sqlite3.connect('data/messages.db')
+        _cur = _con.cursor()
+        messages = _cur.execute("SELECT * FROM messages WHERE rid = ? ORDER BY ts ASC", (task['room'],)).fetchall()
         # channel["log"].info(f"Migrating room {channel['matrix_room']}")
-        if channel["messageList"]:
-            migrate_messages(channel["messageList"], channel["matrix_room"], config_yaml, channel["log"])
-        channel["bar"](1)
+        if messages:
+            migrate_messages(messages, config_yaml, task["log"])
+        task["bar"]()
         workerQueue.task_done()
 
 
-def migrate_messages(messageList, matrix_room, config, log):
-    log.debug('start migration of messages for matrix room: {}'.format(matrix_room))
+def migrate_messages(messageList, config, log):
+    # log.debug('start migration of messages for matrix room: {}'.format(matrix_room))
     global later
     txnId = 1
 
     # with alive_bar(len(messageList), bar='checks', spinner='waves2', force_tty=True) as bar:
     for message in messageList:
         try:
-            txnId = parse_and_send_message(config, message, matrix_room, txnId, False, log)
+            txnId = parse_and_send_message(config, message, txnId, False, log)
         except:
             log.error(
-                "Warning: Couldn't send  message: {} to matrix_room {} id:{}".format(message, matrix_room, txnId)
+                "Warning: Couldn't send  message: {} to matrix_room {} id:{}".format(message, roomLUT[message[1]], txnId)
             )
         # update_progress(progress)
         # bar()
 
     # process postponed messages
     for message in later:
-        txnId = parse_and_send_message(config, message, matrix_room, txnId, True, log)
+        txnId = parse_and_send_message(config, message, txnId, True, log)
 
     # clean up postponed messages
     later = []
@@ -852,6 +861,7 @@ def kick_imported_users(server_location, admin_user, access_token, tick):
             progress = progress + tick
             #update_progress(progress)
             bar(progress)
+
 
 def main():
     logging.captureWarnings(True)
@@ -907,34 +917,31 @@ def main():
         with open('run/luts.yaml', 'w+') as outfile:
             yaml.dump(data, outfile, default_flow_style=False)
 
+    # check if rocketchat_message table has been split up yet
+    if "messages.db" not in os.listdir('data') or len(con.execute("SELECT * FROM messages").fetchall()) <= 0:
+        input("rocketchat_messages table has not been moved into an sqlite table yet. Attempting to do so now! This might take a while. Press enter to proceed\n")
+        fillTable(con)
+
     # send events to rooms
     if not config["run-unattended"]:
         input('Migrating messages to rooms. This may take a while. Press enter to proceed\n')
     else:
         log.info("Migrating messages to rooms. This may take a while...")
 
-    messageData = decodeBson(jsonFiles["rocketchat_message"])
-
-    with alive_bar(len(roomLUT.items()), bar='checks', spinner='waves2', force_tty=True) as bar:
-        for rocketchat_room, matrix_room in roomLUT.items():
-            log = logging.getLogger('ROCKETCHAT.MIGRATE.MESSAGES.{}'.format(roomLUT2[rocketchat_room]))
-            messageList = [message for message in messageData if message["rid"] == rocketchat_room]
-            log.info("Queueing up room: " + roomLUT[rocketchat_room])
+    with alive_bar(len(roomLUT.keys()), bar='checks', spinner='waves2', force_tty=True) as bar:
+        for room in roomLUT.keys():
             workerQueue.put(item={
-                "messageList": messageList,
-                "matrix_room": matrix_room,
+                "room": room,
                 "log": log,
                 "bar": bar
             })
-            # migrate_messages(messageList, matrix_room, config, log)
 
         threadcount = config["message-migration-threads"]
-        threads = []
 
         for i in range(threadcount):
             # Create worker threads.
             log.info(f"Creating worker thread [{i}]")
-            threads.append(threading.Thread(target=migrate_messages_worker, daemon=True).start())
+            threading.Thread(target=migrate_messages_worker, daemon=True).start()
 
         workerQueue.join()
 

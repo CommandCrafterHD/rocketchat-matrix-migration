@@ -12,17 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gzip
+import json
+import sys
+import zipfile
+from datetime import datetime
 
+import sqlite3
 import requests
 import traceback
 
 import os
 import logging
 
+from alive_progress import alive_bar
+
 LOG_LEVEL = os.environ.get('LOG_LEVEL', "INFO").upper()
 
 logging.basicConfig(level=LOG_LEVEL)
-log = logging.getLogger('SLACK.MIGRATE')
+log = logging.getLogger('ROCKETCHAT.MIGRATE')
 log_filename = "log/migration.log"
 os.makedirs(os.path.dirname(log_filename), exist_ok=True)
 fileHandler = logging.FileHandler(log_filename, mode="w", encoding=None, delay=False)
@@ -125,3 +133,46 @@ def invite_user(
                         log.info(r.json()["error"])
                     except Exception:
                         pass
+
+
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, datetime):
+            return o.isoformat()
+        return super().default(o)
+
+
+def fillTable(cur: sqlite3.dbapi2.Connection):
+
+    # rooms = {}
+    # for room in roomLUT.keys():
+    #     rooms[room] = []
+    if "rocketchat_message.json" not in os.listdir('data/'):
+        log.error("rocketchat_message.json not in data/. Refer to README")
+        sys.exit(1)
+
+    log.info("Reading message data")
+    index = 0
+    with alive_bar(None, force_tty=True) as bar:
+        with open('data/rocketchat_message.json', 'r', encoding="utf8") as f:
+            for line in f:
+                message = json.loads(line, )
+                # rooms[message["rid"]].append(message)
+                try:
+                    if "msg" in message:
+                        cur.execute("INSERT INTO messages (_id, rid, msg, ts, u) VALUES (?, ?, ?, ?, ?)",
+                                    (message['_id'],
+                                     message['rid'],
+                                     message['msg'],
+                                     message['ts']['$date']['$numberLong'],
+                                     message['u']['_id']
+                                     ))
+                except Exception as e:
+                    pass
+                index += 1
+                if index >= 1e5:
+                    cur.commit()
+                    index = 0
+                bar()
+            cur.execute("CREATE INDEX IF NOT EXISTS index_rid ON messages (rid)")
+            cur.commit()

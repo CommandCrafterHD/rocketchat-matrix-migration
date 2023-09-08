@@ -6,17 +6,17 @@ domain: example.org
 as_token: very-secret
 # Verify https certificate (True) or ignore 'unsafe' SSL certificates (False)
 verify-ssl: True
-# Don't download files from Slack and upload them to Matrix
+# Don't download files from RocketChat and upload them to Matrix
 skip-files: False
-# Path to the Slack Backup relative to the current directory or absolute
-zipfile: /data/Slack_Export.zip
+# Path to the RocketChat Backup relative to the current directory or absolute
+zipfile: /data/RocketChat_Export.zip
 # Set to 'True' to perform a test without making changes to the homeserver
 dry-run: False
 # Set to 'True' to run without asking for confirmation after each step
 run-unattended: False
-# If you want to use multithreading to migrate messages, specify how many thread workers you want to import messages (set to 1 if you want to import one channel at a time)
+# If you want to use multithreading to migrate messages, specify how many thread workers you want to import messages (set to 1 if you want to import one room at a time)
 message-migration-threads: 5
-# Set to 'False' if archived Channels from Slack should be migrated (and accessible in Matrix)
+# Set to 'False' if archived Channels from RocketChat should be migrated (and accessible in Matrix)
 skip-archived: True
 # Set to 'True' to invite all users to all rooms ( Very slow on rooms creator whit many users )
 invite-all: False
